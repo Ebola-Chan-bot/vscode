@@ -52,11 +52,16 @@ interface ICompileTaskOptions {
 	readonly transpileOnly: boolean | { esbuild: boolean };
 	readonly preserveEnglish: boolean;
 	readonly noEmit?: boolean;
+	// Skip NLS extraction (and the sourcemap plumbing it relies on); localize()
+	// calls keep their string form and fall back to in-code English messages.
+	readonly skipNLS?: boolean;
+	// Emit inline sources content into sourcemaps for `build` output.
+	readonly emitInlineSources?: boolean;
 }
 
-export function createCompile(src: string, { build, emitError, transpileOnly, preserveEnglish, noEmit }: ICompileTaskOptions) {
+export function createCompile(src: string, { build, emitError, transpileOnly, preserveEnglish, noEmit, skipNLS, emitInlineSources = true }: ICompileTaskOptions) {
 	const projectPath = path.join(import.meta.dirname, '../../', src, 'tsconfig.json');
-	const overrideOptions = { ...getTypeScriptCompilerOptions(src), inlineSources: Boolean(build) };
+	const overrideOptions = { ...getTypeScriptCompilerOptions(src), inlineSources: Boolean(build) && emitInlineSources };
 	if (!build) {
 		overrideOptions.inlineSourceMap = true;
 	}
@@ -85,9 +90,9 @@ export function createCompile(src: string, { build, emitError, transpileOnly, pr
 			.pipe(util.loadSourcemaps())
 			.pipe(compilation(token))
 			.pipe(noDeclarationsFilter)
-			.pipe(util.$if(build, nls.nls({ preserveEnglish })))
+			.pipe(util.$if(build && !skipNLS, nls.nls({ preserveEnglish })))
 			.pipe(noDeclarationsFilter.restore)
-			.pipe(util.$if(!transpileOnly, sourcemaps.write('.', {
+			.pipe(util.$if(!transpileOnly && emitInlineSources, sourcemaps.write('.', {
 				addComment: false,
 				includeContent: !!build,
 				sourceRoot: overrideOptions.sourceRoot
@@ -120,7 +125,7 @@ export function transpileTask(src: string, out: string, esbuild?: boolean): task
 	return task;
 }
 
-export function compileTask(src: string, out: string, build: boolean, options: { disableMangle?: boolean; preserveEnglish?: boolean } = {}): task.Task {
+export function compileTask(src: string, out: string, build: boolean, options: { disableMangle?: boolean; preserveEnglish?: boolean; skipNLS?: boolean } = {}): task.Task {
 
 	const task = async () => {
 
@@ -130,7 +135,12 @@ export function compileTask(src: string, out: string, build: boolean, options: {
 
 		// For dev builds we can transpile with esbuild for speed and type-check with tsgo (no emit).
 		// For `build`, keep the full tsb pipeline because the NLS step requires `file.sourceMap`.
-		const compile = createCompile(src, { build, emitError: true, transpileOnly: build ? false : { esbuild: true }, preserveEnglish: !!options.preserveEnglish });
+		// `skipNLS` selects esbuild transpilation for release-style builds too: it skips the
+		// (single-threaded, minutes-long) NLS extraction pass and inline-source sourcemaps.
+		// Runtime stays compatible because un-patched localize() calls keep their string form
+		// and fall back to the in-code English default message (same as dev builds).
+		const skipNLS = !!options.skipNLS;
+		const compile = createCompile(src, { build, emitError: true, transpileOnly: build ? (skipNLS ? { esbuild: true } : false) : { esbuild: true }, preserveEnglish: !!options.preserveEnglish, skipNLS, emitInlineSources: !skipNLS });
 		const srcPipe = gulp.src(`${src}/**`, { base: `${src}` });
 		const generator = new MonacoGenerator(false);
 		if (src === 'src') {

@@ -22,7 +22,7 @@ import * as fs from 'fs';
 import glob from 'glob';
 import { promisify } from 'util';
 import rceditCallback from 'rcedit';
-import { compileBuildWithManglingTask } from './gulpfile.compile.ts';
+import { compileBuildWithManglingTask, compileBuildWithoutManglingTask, compileBuildDevFastTask } from './gulpfile.compile.ts';
 import { cleanExtensionsBuildTask, compileNonNativeExtensionsBuildTask, compileNativeExtensionsBuildTask, compileExtensionMediaBuildTask, compileCopilotExtensionBuildTask } from './gulpfile.extensions.ts';
 import { vscodeWebResourceIncludes, createVSCodeWebFileContentMapper } from './gulpfile.vscode.web.ts';
 import * as cp from 'child_process';
@@ -534,9 +534,14 @@ function packageTask(type: string, platform: string, arch: string, sourceFolderN
 }
 
 function hasAuthenticodeSignature(filePath: string): Promise<boolean> {
-	return new Promise((resolve, reject) => {
+	return new Promise((resolve) => {
 		const proc = cp.spawn('signtool.exe', ['verify', '/pa', filePath]);
-		proc.on('error', reject);
+		proc.on('error', () => {
+			// signtool.exe is part of the Windows SDK signing tools and may not
+			// be installed/available in development environments. Treat the file
+			// as unsigned so the build can continue without signature stripping.
+			resolve(false);
+		});
 		proc.on('exit', code => resolve(code === 0));
 	});
 }
@@ -671,8 +676,15 @@ function tweakProductForServerWeb(product: typeof import('../product.json')) {
 			const serverTaskCI = task.define(`vscode-${type}${dashed(platform)}${dashed(arch)}${dashed(minified)}-ci`, task.series(...packageTasks));
 			task.task(serverTaskCI);
 
+			// VSCODE_SKIP_MANGLE: local/development builds (e.g. a self-hosted debug
+			// server) can skip mangling, which is memory- and time-intensive and only
+			// serves release-size optimization. VSCODE_SKIP_NLS additionally selects
+			// an esbuild-transpile-only pipeline that also skips NLS extraction and
+			// inline-source sourcemaps, at the cost of untranslated (English) UI
+			// strings, which is fine for self-hosted servers.
+			const compileBuildTask = process.env['VSCODE_SKIP_NLS'] ? compileBuildDevFastTask : (process.env['VSCODE_SKIP_MANGLE'] ? compileBuildWithoutManglingTask : compileBuildWithManglingTask);
 			const serverTask = task.define(`vscode-${type}${dashed(platform)}${dashed(arch)}${dashed(minified)}`, task.series(
-				compileBuildWithManglingTask,
+				compileBuildTask,
 				cleanExtensionsBuildTask,
 				compileNonNativeExtensionsBuildTask,
 				compileCopilotExtensionBuildTask,
@@ -681,6 +693,35 @@ function tweakProductForServerWeb(product: typeof import('../product.json')) {
 				serverTaskCI
 			));
 			task.task(serverTask);
+
+			if (!minified) {
+				// Fast rebuild for local iteration (e.g. a self-hosted debug server):
+				// recompiles the source, re-bundles, and replaces only `out/` inside
+				// the already-packaged directory, skipping extension compilation and
+				// full packaging. Requires a previous full build of this target.
+				const fastRebuildTask = task.define(`vscode-${type}${dashed(platform)}${dashed(arch)}-fast`, task.series(
+					compileBuildTask,
+					bundleTask,
+					async () => {
+						const outputDir = path.join(BUILD_ROOT, destinationFolderName);
+						if (!fs.existsSync(path.join(outputDir, 'node.exe'))) {
+							throw new Error(`Fast rebuild requires an existing package directory '${outputDir}'. Run the full build task vscode-${type}${dashed(platform)}${dashed(arch)} first.`);
+						}
+						const outDir = path.join(outputDir, 'out');
+						fs.rmSync(outDir, { recursive: true, force: true });
+						fs.mkdirSync(outDir, { recursive: true });
+						await new Promise<void>((resolve, reject) => {
+							gulp.src(sourceFolderName + '/**', { base: '.' })
+								.pipe(rename(function (path) { path.dirname = path.dirname!.replace(new RegExp('^' + sourceFolderName), 'out'); }))
+								.pipe(filter(['**', '!**/*.{js,css}.map']))
+								.pipe(vfs.dest(BUILD_ROOT))
+								.on('error', reject)
+								.on('end', resolve);
+						});
+					}
+				));
+				task.task(fastRebuildTask);
+			}
 		});
 	});
 });
